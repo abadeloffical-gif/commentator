@@ -183,7 +183,7 @@ jobs:
               }
           }
           EOF_5
-          mkdir -p "$(dirname 'app/src/main/java/com/jj/commentator/CommentaryService.kt')"
+                    mkdir -p "$(dirname 'app/src/main/java/com/jj/commentator/CommentaryService.kt')"
           cat > 'app/src/main/java/com/jj/commentator/CommentaryService.kt' <<'EOF_6'
           package com.jj.commentator
 
@@ -356,8 +356,7 @@ jobs:
                       DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, r.surface, null, null
                   )
               }
-
-              private fun setupTts() {
+                            private fun setupTts() {
                   tts = TextToSpeech(this) { status ->
                       if (status == TextToSpeech.SUCCESS) {
                           val r = tts?.setLanguage(Locale("ar"))
@@ -429,3 +428,280 @@ jobs:
               }
 
               // Cheap "did anything move" check on a 32x18 thumbnail
+              private fun changed(bmp: Bitmap): Boolean {
+                  val w = 32
+                  val h = 18
+                  val small = Bitmap.createScaledBitmap(bmp, w, h, false)
+                  val px = IntArray(w * h)
+                  small.getPixels(px, 0, w, 0, 0, w, h)
+                  val prev = prevSmall
+                  prevSmall = px
+                  if (prev == null) return true
+                  var sum = 0L
+                  for (i in px.indices) {
+                      val a = px[i]
+                      val b = prev[i]
+                      sum += abs(((a shr 16) and 0xFF) - ((b shr 16) and 0xFF)) +
+                          abs(((a shr 8) and 0xFF) - ((b shr 8) and 0xFF)) +
+                          abs((a and 0xFF) - (b and 0xFF))
+                  }
+                  return sum / (px.size * 3f) > 4f
+              }
+
+              private fun ask(bmp: Bitmap): Pair<String, String> {
+                  val out = ByteArrayOutputStream()
+                  bmp.compress(Bitmap.CompressFormat.JPEG, 80, out)
+                  val b64 = Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
+
+                  val recent = if (history.isEmpty()) "(none yet)" else history.joinToString("\n") { "- $it" }
+                  val known = roster.entries.sortedByDescending { it.value.second }.take(30)
+                      .joinToString("\n") { "${it.key} = ${it.value.first}" }
+                      .ifEmpty { "(none yet)" }
+                  val prompt = "Previous lines (never repeat them):\n$recent\n\n" +
+                      "Player names already read on screen (reuse these exact Arabic spellings if they match, " +
+                      "but only if the name is visible in THIS frame):\n$known\n\n" +
+                      "Comment on this moment. JSON only."
+
+                  val content = JSONArray()
+                      .put(
+                          JSONObject().put("type", "image").put(
+                              "source",
+                              JSONObject().put("type", "base64").put("media_type", "image/jpeg").put("data", b64)
+                          )
+                      )
+                      .put(JSONObject().put("type", "text").put("text", prompt))
+                  val body = JSONObject()
+                      .put("model", Persona.MODEL)
+                      .put("max_tokens", 300)
+                      .put("system", Persona.system(dialect))
+                      .put(
+                          "messages",
+                          JSONArray().put(JSONObject().put("role", "user").put("content", content))
+                      )
+
+                  val req = Request.Builder()
+                      .url("https://api.anthropic.com/v1/messages")
+                      .header("x-api-key", apiKey)
+                      .header("anthropic-version", "2023-06-01")
+                      .post(body.toString().toRequestBody("application/json".toMediaType()))
+                      .build()
+
+                  val raw = http.newCall(req).execute().use { resp ->
+                      val txt = resp.body?.string() ?: ""
+                      if (!resp.isSuccessful) throw RuntimeException("API ${resp.code}: ${txt.take(120)}")
+                      JSONObject(txt).getJSONArray("content").getJSONObject(0).getString("text").trim()
+                  }
+                  return parse(raw)
+              }
+
+              private fun parse(raw: String): Pair<String, String> {
+                  val s = raw.indexOf('{')
+                  val e = raw.lastIndexOf('}')
+                  var line = "SKIP"
+                  var energy = "rising"
+                  if (s >= 0 && e > s) {
+                      try {
+                          val j = JSONObject(raw.substring(s, e + 1))
+                          line = j.optString("line", "SKIP").trim()
+                          energy = j.optString("energy", "rising").trim().lowercase()
+                          val names = j.optJSONArray("names")
+                          if (names != null) {
+                              for (i in 0 until names.length()) {
+                                  val n = names.optJSONObject(i) ?: continue
+                                  val en = n.optString("en").trim()
+                                  val ar = n.optString("ar").trim()
+                                  if (en.isNotEmpty()) {
+                                      val old = roster[en]
+                                      roster[en] = Pair(old?.first ?: ar.ifEmpty { en }, (old?.second ?: 0) + 1)
+                                  }
+                              }
+                          }
+                      } catch (_: Exception) {
+                          line = "SKIP"
+                      }
+                  }
+                  if (!ENERGY.containsKey(energy)) energy = "rising"
+                  return Pair(line, energy)
+              }
+                            private fun speak(raw: String, energy: String) {
+                  val text = Persona.clean(raw)
+                  if (text.isBlank()) return
+                  val p = ENERGY.getValue(energy)
+                  speaking.set(true)
+                  main.post {
+                      val t = tts
+                      if (t == null) {
+                          speaking.set(false)
+                          return@post
+                      }
+                      t.setSpeechRate(p[0])
+                      t.setPitch(p[1])
+                      val b = Bundle()
+                      b.putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, p[2])
+                      if (t.speak(text, TextToSpeech.QUEUE_FLUSH, b, "line") != TextToSpeech.SUCCESS) {
+                          speaking.set(false)
+                      }
+                  }
+              }
+
+              private fun toast(msg: String) {
+                  if (msg == lastToast) return
+                  lastToast = msg
+                  main.post { Toast.makeText(applicationContext, msg, Toast.LENGTH_LONG).show() }
+              }
+
+              override fun onDestroy() {
+                  stopped = true
+                  running = false
+                  worker?.interrupt()
+                  display?.release()
+                  reader?.close()
+                  projection?.stop()
+                  tts?.stop()
+                  tts?.shutdown()
+                  super.onDestroy()
+              }
+          }
+          EOF_6
+          mkdir -p "$(dirname 'app/src/main/java/com/jj/commentator/MainActivity.kt')"
+          cat > 'app/src/main/java/com/jj/commentator/MainActivity.kt' <<'EOF_7'
+          package com.jj.commentator
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.media.projection.MediaProjectionManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.text.InputType
+          import android.view.View
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.RadioButton
+          import android.widget.RadioGroup
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+
+              private lateinit var keyBox: EditText
+              private lateinit var gulf: RadioButton
+              private lateinit var maghreb: RadioButton
+              private lateinit var btn: Button
+              private val reqCapture = 42
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val prefs = getSharedPreferences("cfg", MODE_PRIVATE)
+                  val pad = (20 * resources.displayMetrics.density).toInt()
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad * 2, pad, pad)
+                  }
+
+                  fun label(t: String, size: Float = 16f) = TextView(this).apply {
+                      text = t
+                      textSize = size
+                      setPadding(0, pad / 2, 0, pad / 4)
+                  }
+
+                  root.addView(label("AI Football Commentator", 24f))
+                  root.addView(label("Anthropic API key"))
+                  keyBox = EditText(this).apply {
+                      hint = "sk-ant-..."
+                      setText(prefs.getString("key", ""))
+                      inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                  }
+                  root.addView(keyBox)
+
+                  root.addView(label("Commentator dialect"))
+                  val group = RadioGroup(this)
+                  gulf = RadioButton(this).apply { text = "Gulf (Khaleeji)"; id = View.generateViewId() }
+                  maghreb = RadioButton(this).apply { text = "Maghreb (Morocco / Algeria)"; id = View.generateViewId() }
+                  group.addView(gulf)
+                  group.addView(maghreb)
+                  if (prefs.getString("dialect", "gulf") == "maghreb") maghreb.isChecked = true else gulf.isChecked = true
+                  root.addView(group)
+
+                  btn = Button(this)
+                  btn.setOnClickListener { onToggle() }
+                  root.addView(btn)
+
+                  root.addView(
+                      label(
+                          "1. Mute eFootball's own commentary\n" +
+                              "2. Tap Start and allow screen capture\n" +
+                              "3. Open eFootball and play\n\n" +
+                              "Stop it from the notification or from this screen."
+                      )
+                  )
+                  setContentView(ScrollView(this).apply { addView(root) })
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  refresh()
+              }
+
+              private fun refresh() {
+                  btn.text = if (CommentaryService.running) "Stop commentating" else "Start commentating"
+              }
+
+              private fun onToggle() {
+                  if (CommentaryService.running) {
+                      startService(
+                          Intent(this, CommentaryService::class.java).setAction(CommentaryService.ACTION_STOP)
+                      )
+                      btn.postDelayed({ refresh() }, 500)
+                      return
+                  }
+
+                  val key = keyBox.text.toString().trim()
+                  if (key.isEmpty()) {
+                      Toast.makeText(this, "Paste your API key first", Toast.LENGTH_SHORT).show()
+                      return
+                  }
+                  getSharedPreferences("cfg", MODE_PRIVATE).edit()
+                      .putString("key", key)
+                      .putString("dialect", if (maghreb.isChecked) "maghreb" else "gulf")
+                      .apply()
+
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  }
+
+                  val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  @Suppress("DEPRECATION")
+                  startActivityForResult(mgr.createScreenCaptureIntent(), reqCapture)
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == reqCapture && resultCode == RESULT_OK && data != null) {
+                      val svc = Intent(this, CommentaryService::class.java)
+                          .putExtra(CommentaryService.EXTRA_CODE, resultCode)
+                          .putExtra(CommentaryService.EXTRA_DATA, data)
+                      startForegroundService(svc)
+                      Toast.makeText(this, "Live! Now open eFootball.", Toast.LENGTH_LONG).show()
+                      btn.postDelayed({ refresh() }, 500)
+                  }
+              }
+          }
+          EOF_7
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+      - name: Publish APK as a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ github.run_number }}" app/build/outputs/apk/debug/app-debug.apk \
+            --title "Commentator build ${{ github.run_number }}" \
+            --notes "Download app-debug.apk below and install it on your phone."
