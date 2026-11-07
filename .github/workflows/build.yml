@@ -1,1 +1,431 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Write project files
+        run: |
+          mkdir -p "$(dirname 'settings.gradle.kts')"
+          cat > 'settings.gradle.kts' <<'EOF_0'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "Commentator"
+          include(":app")
+          EOF_0
+          mkdir -p "$(dirname 'build.gradle.kts')"
+          cat > 'build.gradle.kts' <<'EOF_1'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_1
+          mkdir -p "$(dirname 'gradle.properties')"
+          cat > 'gradle.properties' <<'EOF_2'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF_2
+          mkdir -p "$(dirname 'app/build.gradle.kts')"
+          cat > 'app/build.gradle.kts' <<'EOF_3'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
 
+          android {
+              namespace = "com.jj.commentator"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.jj.commentator"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("com.squareup.okhttp3:okhttp:4.12.0")
+          }
+          EOF_3
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'EOF_4'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.TTS_SERVICE" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:allowBackup="false"
+                  android:label="AI Commentator"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".CommentaryService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaProjection" />
+              </application>
+          </manifest>
+          EOF_4
+          mkdir -p "$(dirname 'app/src/main/java/com/jj/commentator/Persona.kt')"
+          cat > 'app/src/main/java/com/jj/commentator/Persona.kt' <<'EOF_5'
+          package com.jj.commentator
+
+          object Persona {
+              // Fast and cheap. Use "claude-sonnet-5-5" if names get misread a lot.
+              const val MODEL = "claude-haiku-5-5"
+
+              // If the voice says a name wrong, add it here: text the AI wrote -> text the voice should say.
+              val PRONUNCIATIONS = mapOf<String, String>(
+                  // "مبابي" to "مْبَابِّي",
+              )
+
+              private const val GULF = """أنت معلّق كرة قدم خليجي اسمك "فهد المطيري". أسلوبك حيّ وعفوي مثل واحد جالس يعلّق على الهوا مباشرة، فيه حماس وهيبة، وتنفعل مع اللقطة بصدق.
+          تتكلم باللهجة الخليجية (كويتية/سعودية): "يا سلام"، "شوف شوف"، "وين رايح"، "الله الله"، "ما شاء الله عليه".
+          تحب العبارات الكبيرة في اللحظات الحاسمة وتهدأ في اللقطات العادية."""
+
+              private const val MAGHREB = """أنت معلّق كرة قدم مغاربي اسمك "كريم بن صالح". أسلوبك حيّ وعفوي مثل واحد جالس يعلّق على الهوا مباشرة، فيه حماس وهيبة، وتنفعل مع اللقطة بصدق.
+          تتكلم بالدارجة المغربية الممزوجة بشوية جزائري: "واو"، "شوف أشنو دار"، "بالصح"، "هاداك اللعب"، "يا ربي".
+          تحب العبارات الكبيرة في اللحظات الحاسمة وتهدأ في اللقطات العادية."""
+
+              private const val RULES = """
+
+          Rules:
+          - Sound like a REAL person talking live, not a script. Vary the length: a quiet moment can be 3-6 words,
+            a build-up 8-14, a goal can run 15-25 words with repetition and shouting.
+          - Use natural spoken rhythm: short bursts, interjections, half-finished thoughts, repeated words for
+            emphasis, sighs and reactions, and "..." for dramatic pauses. Use "!" for excitement.
+            Never sound like you are reading an essay or a list.
+          - Don't describe everything. Real commentators breathe: sometimes just react to the crowd or the mood.
+          - Pick an "energy" for each line: "calm" (build-up, possession, quiet), "rising" (attack developing,
+            dangerous cross, corner), "hype" (shot, goal, big save, near miss).
+          - Never repeat a phrase or opening from the previous lines you are given.
+          - Comment only on what you see in the image: ball, attack, shot, keeper, corner, goal, replay.
+          - If nothing important is happening (menu, loading screen, lineup), reply with the single word SKIP.
+          - Goal = a huge moment. Missed chance = dramatic heartbreak.
+          - PLAYER NAMES: eFootball shows names on the name tag above the controlled player, in goal and
+            replay banners, substitution screens, and line-up screens. Use a name ONLY if you can clearly read it
+            in the image. Never guess a name from the kit or the face. If not readable, say "المهاجم" / "الحارس" etc.
+          - PRONUNCIATION (the voice is a text-to-speech engine, so spelling decides how it sounds):
+            * Write every player name and team name in ARABIC script, spelled the way it is really pronounced in
+              its original language (Mbappe -> مْبَابِّي, Vinicius -> فينيسيوس, Haaland -> هالَند), never a
+              letter-by-letter transliteration.
+            * Add full diacritics (tashkeel) to player names, team names, and any word the engine could misread.
+              Normal common words can stay without diacritics.
+            * Never leave Latin letters, digits, emojis, or symbols in "line". Write numbers as Arabic words
+              (2-1 -> اثنين واحد). Use "،" and "!" and "..." for pauses and rhythm.
+            * Spell dialect words close to standard spelling so the engine reads them clearly.
+          - Reply with JSON only, no markdown fences:
+            {"line": "<the Arabic commentary, or SKIP>", "energy": "calm|rising|hype", "names": [{"en": "<name exactly as spelled on screen>", "ar": "<same name in Arabic script with diacritics, as used in line>"}]}"""
+
+              fun system(dialect: String): String =
+                  (if (dialect == "maghreb") MAGHREB else GULF) + RULES
+
+              // Strip things Arabic voices mangle (emoji, markdown, Latin letters) and apply overrides.
+              fun clean(text: String): String {
+                  var t = text
+                  for ((wrong, right) in PRONUNCIATIONS) t = t.replace(wrong, right)
+                  t = t.replace(Regex("[*_`#~<>\\[\\]{}|]"), "")
+                  t = t.replace(Regex("[\\x{1F000}-\\x{1FAFF}\\u2600-\\u27BF]"), "")
+                  t = t.replace(Regex("[A-Za-z]+"), "")
+                  return t.replace(Regex("\\s+"), " ").trim()
+              }
+          }
+          EOF_5
+          mkdir -p "$(dirname 'app/src/main/java/com/jj/commentator/CommentaryService.kt')"
+          cat > 'app/src/main/java/com/jj/commentator/CommentaryService.kt' <<'EOF_6'
+          package com.jj.commentator
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.Bitmap
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.Icon
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.ImageReader
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.speech.tts.TextToSpeech
+          import android.speech.tts.UtteranceProgressListener
+          import android.util.Base64
+          import android.widget.Toast
+          import okhttp3.MediaType.Companion.toMediaType
+          import okhttp3.OkHttpClient
+          import okhttp3.Request
+          import okhttp3.RequestBody.Companion.toRequestBody
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.ByteArrayOutputStream
+          import java.util.Locale
+          import java.util.concurrent.TimeUnit
+          import java.util.concurrent.atomic.AtomicBoolean
+          import kotlin.math.abs
+          import kotlin.math.max
+          import kotlin.math.min
+
+          class CommentaryService : Service() {
+
+              companion object {
+                  const val ACTION_STOP = "com.jj.commentator.STOP"
+                  const val EXTRA_CODE = "code"
+                  const val EXTRA_DATA = "data"
+                  const val CHANNEL = "commentator"
+
+                  @Volatile
+                  var running = false
+
+                  private const val POLL_MS = 2500L
+                  private const val MAX_HISTORY = 20
+
+                  // rate, pitch, volume per energy level
+                  private val ENERGY = mapOf(
+                      "calm" to floatArrayOf(0.95f, 0.80f, 0.9f),
+                      "rising" to floatArrayOf(1.10f, 0.95f, 1.0f),
+                      "hype" to floatArrayOf(1.25f, 1.10f, 1.0f)
+                  )
+              }
+
+              private val main = Handler(Looper.getMainLooper())
+              private var projection: MediaProjection? = null
+              private var reader: ImageReader? = null
+              private var display: VirtualDisplay? = null
+              private var tts: TextToSpeech? = null
+
+              @Volatile
+              private var ttsReady = false
+              private val speaking = AtomicBoolean(false)
+
+              @Volatile
+              private var stopped = false
+              private var worker: Thread? = null
+
+              private val http = OkHttpClient.Builder().callTimeout(30, TimeUnit.SECONDS).build()
+              private val history = ArrayDeque<String>()
+              private val roster = LinkedHashMap<String, Pair<String, Int>>() // en -> (arabic spelling, count)
+
+              private var apiKey = ""
+              private var dialect = "gulf"
+              private var capW = 0
+              private var capH = 0
+              private var prevSmall: IntArray? = null
+              private var lastToast = ""
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent?.action == ACTION_STOP) {
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+                  if (running) return START_NOT_STICKY
+
+                  val code = intent?.getIntExtra(EXTRA_CODE, 0) ?: 0
+                  @Suppress("DEPRECATION")
+                  val data = intent?.getParcelableExtra<Intent>(EXTRA_DATA)
+                  if (data == null) {
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+
+                  val prefs = getSharedPreferences("cfg", MODE_PRIVATE)
+                  apiKey = prefs.getString("key", "") ?: ""
+                  dialect = prefs.getString("dialect", "gulf") ?: "gulf"
+
+                  startForegroundCompat()
+                  running = true
+                  stopped = false
+                  setupTts()
+                  setupCapture(code, data)
+                  worker = Thread { loop() }.also { it.start() }
+                  return START_NOT_STICKY
+              }
+
+              private fun startForegroundCompat() {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(
+                      NotificationChannel(CHANNEL, "Commentator", NotificationManager.IMPORTANCE_LOW)
+                  )
+                  val stopIntent = PendingIntent.getService(
+                      this, 0,
+                      Intent(this, CommentaryService::class.java).setAction(ACTION_STOP),
+                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                  )
+                  val stopAction = Notification.Action.Builder(
+                      Icon.createWithResource(this, android.R.drawable.ic_media_pause), "Stop", stopIntent
+                  ).build()
+                  val n = Notification.Builder(this, CHANNEL)
+                      .setContentTitle("Commentator is live")
+                      .setContentText("Watching your screen. Tap Stop to end.")
+                      .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                      .addAction(stopAction)
+                      .setOngoing(true)
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+                  } else {
+                      startForeground(1, n)
+                  }
+              }
+
+              private fun setupCapture(code: Int, data: Intent) {
+                  val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  val mp = mgr.getMediaProjection(code, data)
+                  projection = mp
+                  // Required on Android 14+ before creating the virtual display
+                  mp.registerCallback(object : MediaProjection.Callback() {
+                      override fun onStop() {
+                          main.post { stopSelf() }
+                      }
+                  }, main)
+
+                  // eFootball is landscape, so always capture landscape-shaped frames (max 1280px wide)
+                  val m = resources.displayMetrics
+                  val longSide = max(m.widthPixels, m.heightPixels)
+                  val shortSide = min(m.widthPixels, m.heightPixels)
+                  val scale = 1280f / longSide
+                  capW = (longSide * scale).toInt().coerceAtLeast(2)
+                  capH = (shortSide * scale).toInt().coerceAtLeast(2)
+
+                  val r = ImageReader.newInstance(capW, capH, PixelFormat.RGBA_8888, 2)
+                  reader = r
+                  display = mp.createVirtualDisplay(
+                      "commentator", capW, capH, m.densityDpi,
+                      DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, r.surface, null, null
+                  )
+              }
+
+              private fun setupTts() {
+                  tts = TextToSpeech(this) { status ->
+                      if (status == TextToSpeech.SUCCESS) {
+                          val r = tts?.setLanguage(Locale("ar"))
+                          if (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED) {
+                              toast("Arabic voice missing: Settings > Text-to-speech > Google > Install voice data > Arabic")
+                          }
+                          tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                              override fun onStart(utteranceId: String?) {}
+                              override fun onDone(utteranceId: String?) {
+                                  speaking.set(false)
+                              }
+
+                              @Deprecated("Deprecated in Java")
+                              override fun onError(utteranceId: String?) {
+                                  speaking.set(false)
+                              }
+                          })
+                          ttsReady = true
+                      } else {
+                          toast("Text-to-speech failed to start")
+                      }
+                  }
+              }
+
+              // ---------------- main loop ----------------
+
+              private fun loop() {
+                  while (!stopped) {
+                      val t0 = System.currentTimeMillis()
+                      try {
+                          if (ttsReady && !speaking.get()) {
+                              val bmp = grabFrame()
+                              if (bmp != null && changed(bmp)) {
+                                  val (line, energy) = ask(bmp)
+                                  if (line.isNotBlank() && !line.equals("SKIP", ignoreCase = true)) {
+                                      history.addLast(line)
+                                      if (history.size > MAX_HISTORY) history.removeFirst()
+                                      speak(line, energy)
+                                  }
+                              }
+                          }
+                      } catch (e: Exception) {
+                          toast("Error: ${e.message}")
+                      }
+                      val left = POLL_MS - (System.currentTimeMillis() - t0)
+                      if (left > 0) {
+                          try {
+                              Thread.sleep(left)
+                          } catch (_: InterruptedException) {
+                              return
+                          }
+                      }
+                  }
+              }
+
+              private fun grabFrame(): Bitmap? {
+                  val img = reader?.acquireLatestImage() ?: return null
+                  try {
+                      val p = img.planes[0]
+                      val rowPad = p.rowStride - p.pixelStride * capW
+                      val full = Bitmap.createBitmap(
+                          capW + rowPad / p.pixelStride, capH, Bitmap.Config.ARGB_8888
+                      )
+                      full.copyPixelsFromBuffer(p.buffer)
+                      return Bitmap.createBitmap(full, 0, 0, capW, capH)
+                  } finally {
+                      img.close()
+                  }
+              }
+
+              // Cheap "did anything move" check on a 32x18 thumbnail
